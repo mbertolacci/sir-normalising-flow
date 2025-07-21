@@ -1,0 +1,550 @@
+---
+title: "Deterministic SIR Model with Stochastic Cases, with Normalising Flow"
+output: pdf_document
+---
+
+```{r}
+library(torch)
+library(torchflow)
+```
+
+# Stochastic SIR model
+
+## Forward simulation
+
+The following function simulates the stochastic SIR model. The model is defined by the following parameters:
+
+- $N$ is the total population size.
+- $D$ is the duration of the infection.
+- $R_0$ is the basic reproduction number.
+- $\gamma = 1 / D$ is the rate of recovery.
+- $\beta = R_0 \gamma$ is the rate of infection.
+- $\epsilon$ is the rate of new infections from outside the population.
+- $\alpha$ is the rate of reporting cases.
+- $S_1, I_1, R_1$ are the initial number of susceptible, infected, and recovered individuals
+
+At time $t$, the number of new infections is given by the binomial distribution:
+$$
+  I_t \sim \text{Binomial}(S_{t - 1}, \lambda_t)
+$$
+where $\lambda_t = 1 - \exp(-\beta I_{t - 1} / N - \epsilon)$. The parameter $\epsilon$ is the rate of new infections from outside the population, which ensures that an epidemic can reappear even after it is extinct.
+
+The number of new recoveries is given by the binomial distribution:
+$$
+  R_t \sim \text{Binomial}(I_{t - 1}, \gamma)
+$$
+where $\gamma$ is the rate of recovery.
+
+The number of new cases is given by the binomial distribution:
+$$
+  C_t \sim \text{Binomial}(I_t, \alpha)
+$$
+
+```{r}
+forward_simulate <- function(
+  T,
+  N,
+  alpha,
+  beta,
+  gamma,
+  epsilon,
+  S_1,
+  I_1,
+  R_1
+) {
+  n <- length(alpha)
+
+  S <- matrix(0, n, T)
+  I <- matrix(0, n, T)
+  R <- matrix(0, n, T)
+  cases <- matrix(0, n, T)
+
+  S[, 1] <- round(N * S_1)
+  I[, 1] <- round(N * I_1)
+  R[, 1] <- round(N * R_1)
+  
+  for (t in 2 : T) {
+    lambda <- 1 - exp(-beta * I[, t - 1] / N - epsilon)
+    new_infections <- rbinom(n, S[, t - 1], lambda)
+    new_recoveries <- rbinom(n, I[, t - 1], gamma)
+    new_cases <- rbinom(n, new_infections, alpha)
+
+    S[, t] <- S[, t - 1] - new_infections
+    I[, t] <- I[, t - 1] + new_infections - new_recoveries
+    R[, t] <- R[, t - 1] + new_recoveries
+    cases[, t] <- new_cases
+  }
+
+  list(
+    S = S / N,
+    I = I / N,
+    R = R / N,
+    cases = cases / N
+  )
+}
+```
+
+We normalise S, I, R, and cases to be between 0 and 1, a proportion of the total population.
+
+Here is an example of a forward simulation:
+
+```{r}
+set.seed(20250720)
+example_simulation <- forward_simulate(
+  T = 100,
+  N = 300,
+  alpha = 0.25,
+  beta = 0.5,
+  gamma = 0.2,
+  epsilon = 0.0001,
+  S_1 = 1,
+  I_1 = 0,
+  R_1 = 0
+)
+
+plot(1 : 100, example_simulation$S[1, ], type = "l", xlab = 'Time', col = 'blue', ylim = c(0, 1))
+lines(1 : 100, example_simulation$I[1, ], col = 'red')
+lines(1 : 100, example_simulation$R[1, ], col = 'green')
+lines(1 : 100, example_simulation$cases[1, ], type = "h", col = 'black')
+legend(
+  'topright', c('S', 'I', 'R', 'Cases'),
+  col = c('blue', 'red', 'green', 'black'),
+  lty = 1, bg = 'white'
+)
+```
+
+Here we generate from a prior distribution as follows:
+
+- $R_0$ is uniformly distributed between 1.01 and 3.
+- $D$ is uniformly distributed between 2 and 6.
+- $\epsilon$ is uniformly distributed between 1e-4 and 2 * 1e-4.
+- $\alpha$ is uniformly distributed between 0.2 and 0.3.
+
+Once these are generated, we simulate a single trajectory of the model.
+
+```{r}
+generate <- function(
+  n,
+  T,
+  N,
+  R_0_min = 1.01,
+  R_0_max = 3,
+  D_min = 2,
+  D_max = 6,
+  epsilon_min = 1e-4,
+  epsilon_max = 2 * 1e-4,
+  alpha_min = 0.2,
+  alpha_max = 0.3
+) {
+  R_0 <- runif(n, R_0_min, R_0_max)
+  D <- runif(n, D_min, D_max)
+  epsilon <- runif(n, epsilon_min, epsilon_max)
+  alpha <- runif(n, alpha_min, alpha_max)
+  gamma <- 1 / D
+  beta <- R_0 * gamma
+
+  simulation <- forward_simulate(
+    T,
+    N,
+    alpha,
+    beta,
+    gamma,
+    epsilon,
+    1,
+    0,
+    0
+  )
+
+  c(simulation, list(
+    R_0 = R_0,
+    D = D,
+    alpha = alpha,
+    beta = beta,
+    gamma = gamma,
+    epsilon = epsilon
+  ))
+}
+```
+
+We generate four example datasets:
+
+```{r}
+T <- 100
+N <- 300
+example_data <- generate(4, T = T, N = N)
+str(example_data)
+print(example_data[c('gamma', 'beta', 'alpha', 'epsilon')])
+```
+
+We can plot the results:
+
+```{r}
+withr::with_par(list(mfrow = c(2, 1), mar = c(4, 4, 1, 1)), {
+  matplot(t(example_data$I), type = "l", lty = 1, xlab = 'Time', ylab = 'Infections')
+  matplot(t(example_data$cases), type = "h", lty = 1, xlab = 'Time', ylab = 'Cases')
+})
+```
+
+# Normalising flow
+
+The following code define a normalising flow model that takes as input the number of cases up to time $t$. It then approximates the posterior distribution of the $(\alpha, \beta, \gamma, \epsilon, S_t, I_t)$ parameters. More precisely, it approximates a transformation of the parameters:
+
+- $\log \alpha$
+- $\log \beta$
+- $\log \gamma$
+- $\log \epsilon$
+- $\mathrm{logit}(S_t)$, where $S_t$ is clamped to be between 1e-5 and 1 - 1e-5
+- $\mathrm{logit}(I_t)$, where $I_t$ is clamped to be between 1e-5 and 1 - 1e-5
+
+The network that summarises the data into a fixed dimensional space is a Gated Recurrent Unit (GRU). This is a type of recurrent neural network that is designed to process sequential data. It is constructed such that, after all GRU layers have been applied, the output at time $t$ is only a function of the data up to time $t$. This allows us to input varying sequence lengths.
+
+```{r}
+device <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
+
+summary_gru <- nn_module(
+  "summary_gru",
+  initialize = function(n_input_size, n_layers, n_output_size) {
+    self$n_layers <- n_layers
+    self$gru <- nn_gru(n_input_size, n_output_size, n_layers, batch_first = TRUE)
+  },
+  forward = function(conditioning) {
+    t <- conditioning[, 1, drop = FALSE]
+    x <- conditioning[, 2 : conditioning$shape[2], drop = FALSE]
+
+    t_int <- t$to(dtype = torch_int64())
+    x_unsqueezed <- x$unsqueeze(-1)
+
+    # h_all contains the hidden state of the GRU at each time point
+    h_all <- self$gru(x_unsqueezed)[[1]]
+
+    # h_last is the hidden state at the last time point
+    t_int_big <- t_int$unsqueeze(2)$expand(c(-1, -1, h_all$shape[3]))
+    h_last <- torch_gather(h_all, 2, t_int_big)
+    h_last$squeeze(2)
+  }
+)
+
+n_summary <- 128L
+summary_model <- summary_gru(n_input_size = 1, n_layers = 2, n_output_size = n_summary)
+summary_model$to(device = device)
+
+n_params <- 6L
+flow_model <- nn_sequential_conditional_flow(
+  nn_affine_coupling_block(n_params, n_summary),
+  nn_permutation_flow(n_params),
+  nn_affine_coupling_block(n_params, n_summary),
+  nn_permutation_flow(n_params),
+  nn_affine_coupling_block(n_params, n_summary),
+  nn_permutation_flow(n_params),
+  nn_affine_coupling_block(n_params, n_summary),
+  nn_permutation_flow(n_params),
+  nn_affine_coupling_block(n_params, n_summary)
+)
+flow_model$to(device = device)
+
+summarizing_flow_model <- nn_summarizing_conditional_flow(summary_model, flow_model)
+summarizing_flow_model$to(device = device)
+```
+
+Then we define a function to generate batches of data for training and testing:
+
+```{r}
+logit <- function(x) {
+  log(x / (1 - x))
+}
+
+expit <- function(y) {
+  exp(y) / (1 + exp(y))
+}
+
+clamp <- function(x, min, max) {
+  pmax(pmin(x, max), min)
+}
+
+epsilon <- 1e-5
+
+generate_conditional_samples <- function(...) {
+  n <- 1024L
+  data <- generate(n, T = T, N = N)
+  t <- sample.int(T, n, replace = TRUE)
+
+  list(
+    target = torch_tensor(cbind(
+      log(data$alpha),
+      log(data$beta),
+      log(data$gamma),
+      log(data$epsilon),
+      logit(clamp(data$S[cbind(seq_len(n), t)], epsilon, 1 - epsilon)),
+      logit(clamp(data$I[cbind(seq_len(n), t)], epsilon, 1 - epsilon))
+    ), device = device),
+    conditioning = torch_tensor(
+      cbind(t, data$cases),
+      device = device
+    ),
+    latent = torch_stack(list(
+      data$S,
+      data$I,
+      data$R
+    ), dim = -1)$to(device = device)
+  )
+}
+```
+
+We can calculate the initial test loss:
+
+```{r}
+test_set <- generate_conditional_samples()
+
+test_loss <- forward_kl_loss(summarizing_flow_model(test_set$target, test_set$conditioning))
+cat('Initial test loss:', test_loss$item(), '\n')
+```
+
+Now we train the model.
+
+```{r}
+run_training <- function(n_epochs, lr) {
+  system.time(train_conditional_flow(
+    summarizing_flow_model,
+    generate_conditional_samples,
+    n_epochs = n_epochs,
+    batch_size = 256L,
+    lr = lr,
+    after_epoch = function(epoch, ...) {
+      if (epoch %% 64L == 0) {
+        test_loss <- forward_kl_loss(summarizing_flow_model(test_set$target, test_set$conditioning))
+        cat('Epoch', epoch, '| test loss:', test_loss$item(), '\n')
+      }
+    },
+    verbose = interactive()
+  ))
+}
+
+if (!file.exists('summarizing_flow_model.pt')) {
+  run_training(256L, 0.001)
+  run_training(1024L, 0.0001)
+  run_training(512L, 0.00001)
+  torch_save(summarizing_flow_model, 'summarizing_flow_model.pt')
+} else {
+  summarizing_flow_model <- torch_load('summarizing_flow_model.pt')
+  summarizing_flow_model$to(device = device)
+}
+```
+
+The training is complete.
+
+# Results
+
+Let's generate some samples from the approximate posterior.
+
+We will generate samples from the posterior for four entries of the test set.
+
+```{r}
+sample_dataset <- function(n_samples, dataset) {
+  n_entries <- dataset$conditioning$shape[1]
+  samples_tensor <- generate_from_conditional_flow(
+    summarizing_flow_model,
+    n_samples,
+    dataset$conditioning
+  )
+  samples <- as_array(samples_tensor)
+  dimnames(samples) <- list(
+    NULL,
+    NULL,
+    c('alpha', 'beta', 'gamma', 'epsilon', 'S_t', 'I_t')
+  )
+  samples[, , 'alpha'] <- exp(samples[, , 'alpha'])
+  samples[, , 'beta'] <- exp(samples[, , 'beta'])
+  samples[, , 'gamma'] <- exp(samples[, , 'gamma'])
+  samples[, , 'epsilon'] <- exp(samples[, , 'epsilon'])
+  samples[, , 'S_t'] <- expit(samples[, , 'S_t'])
+  samples[, , 'I_t'] <- expit(samples[, , 'I_t'])
+
+  forward_samples <- lapply(seq_len(n_entries), function(i) {
+    test_t <- as_array(dataset$conditioning[i, 1])[1]
+    S_1 <- samples[, i, 'S_t']
+    I_1 <- samples[, i, 'I_t']
+    R_1 <- 1 - S_1 - I_1
+    simulation <- forward_simulate(
+      T = T - test_t + 1L,
+      N = N,
+      alpha = samples[, i, 'alpha'],
+      beta = samples[, i, 'beta'],
+      gamma = samples[, i, 'gamma'],
+      epsilon = samples[, i, 'epsilon'],
+      S_1 = S_1,
+      I_1 = I_1,
+      R_1 = R_1
+    )
+    simulation$time <- test_t : T
+    simulation
+  })
+
+  target <- as_array(dataset$target)
+  colnames(target) <- c('alpha', 'beta', 'gamma', 'epsilon', 'S', 'I')
+  target[, 'alpha'] <- exp(target[, 'alpha'])
+  target[, 'beta'] <- exp(target[, 'beta'])
+  target[, 'gamma'] <- exp(target[, 'gamma'])
+  target[, 'epsilon'] <- exp(target[, 'epsilon'])
+  target[, 'S'] <- expit(target[, 'S'])
+  target[, 'I'] <- expit(target[, 'I'])
+
+  t <- as_array(dataset$conditioning[, 1])
+  cases <- as_array(dataset$conditioning[, 2 : 101])
+  latent <- as_array(dataset$latent)
+
+  list(
+    samples = samples,
+    forward_samples = forward_samples,
+    target = target,
+    cases = cases,
+    latent = latent,
+    t = t
+  )
+}
+
+test_t <- as_array(test_set$conditioning[, 1])
+example_indices <- c(
+  sample(which(test_t < 25), 1),
+  sample(which(test_t < 25), 1),
+  sample(which(test_t >= 25 & test_t < 50), 1),
+  sample(which(test_t >= 25 & test_t < 50), 1),
+  sample(which(test_t >= 50 & test_t < 75), 1),
+  sample(which(test_t >= 50 & test_t < 75), 1),
+  sample(which(test_t >= 75), 1),
+  sample(which(test_t >= 75), 1)
+)
+example_dataset <- list(
+  target = test_set$target[example_indices, ],
+  conditioning = test_set$conditioning[example_indices, , drop = FALSE],
+  latent = test_set$latent[example_indices, , , drop = FALSE]
+)
+
+example_samples <- sample_dataset(256L, example_dataset)
+n_examples <- length(example_indices)
+```
+
+Now we will plot the samples and the true values. First, histograms (red lines are the true values):
+
+```{r, fig.width = 10, fig.height = 15}
+withr::with_par(list(mfrow = c(n_examples, n_params), mar = c(4, 4, 1, 1)), {
+  for (i in seq_len(n_examples)) {
+    plot_histogram <- function(ind, lab) {
+      hist(
+        example_samples$samples[, i, ind],
+        xlab = lab,
+        xlim = range(example_samples$samples[, , ind]),
+        main = paste('Example', i),
+        freq = FALSE,
+        breaks = 30
+      )
+      abline(v = example_samples$target[i, ind], col = 'red')
+    }
+    plot_histogram(1, 'alpha')
+    plot_histogram(2, 'beta')
+    plot_histogram(3, 'gamma')
+    plot_histogram(4, 'epsilon')
+    plot_histogram(5, 'S')
+    plot_histogram(6, 'I')
+  }
+})
+```
+
+Then pairwise plots for the dynamical parameters (red lines are the true values):
+
+```{r, fig.width = 10, fig.height = 15}
+withr::with_par(list(mfrow = c(n_examples, 5), mar = c(4, 4, 1, 1)), {
+  for (i in seq_len(n_examples)) {
+    plot_pair <- function(ind1, ind2, lab1, lab2) {
+      plot(
+        example_samples$samples[, i, ind1],
+        example_samples$samples[, i, ind2],
+        xlab = lab1,
+        ylab = lab2,
+        xlim = range(example_samples$samples[, , ind1]),
+        ylim = range(example_samples$samples[, , ind2]),
+        main = paste('Example', i)
+      )
+      abline(v = example_samples$target[i, ind1], col = 'red')
+      abline(h = example_samples$target[i, ind2], col = 'red')
+    }
+    plot_pair(2, 3, 'beta', 'gamma')
+    plot_pair(2, 4, 'beta', 'epsilon')
+    plot_pair(3, 4, 'gamma', 'epsilon')
+    plot_pair(2, 5, 'beta', 'S_t')
+    plot_pair(3, 5, 'gamma', 'S')
+  }
+})
+```
+
+Then we plot the true and forecasted trajectories of the latent variables. In this plot:
+
+- The black line is the true trajectory.
+- The red lines are the 2.5th, 50th, and 97.5th posterior percentiles of the forecasted trajectories.
+- The blue line is the posterior mean of the forward simulated trajectories.
+
+```{r, fig.width = 10, fig.height = 15}
+plot_forward_samples <- function(samples) {
+  n_examples <- length(samples$forward_samples)
+  withr::with_par(list(mfrow = c(n_examples, 4), mar = c(4, 4, 1, 1)), {
+    for (i in seq_len(n_examples)) {
+      forward_samples_i <- samples$forward_samples[[i]]
+      for (j in 1 : 3) {
+        plot(
+          1 : 100,
+          samples$latent[i, , j],
+          type = 'l',
+          xlab = 'Time',
+          ylab = c('S', 'I', 'R')[j],
+          ylim = c(0, 1)
+        )
+        abline(v = samples$t[i], col = 'red')
+        forward_mean <- apply(forward_samples_i[[j]], 2, mean)
+        forward_quantiles <- apply(forward_samples_i[[j]], 2, quantile, c(0.025, 0.5, 0.975))
+        lines(forward_samples_i$time, forward_quantiles[1, ], lty = 2, col = 'red')
+        lines(forward_samples_i$time, forward_quantiles[2, ], lty = 1, col = 'red')
+        lines(forward_samples_i$time, forward_quantiles[3, ], lty = 2, col = 'red')
+        lines(forward_samples_i$time, forward_mean, lty = 1, col = 'blue')
+      }
+      plot(
+        1 : T,
+        samples$cases[i, ],
+        type = 'h',
+        xlab = 'Time',
+        ylab = 'Cases',
+        ylim = c(0, max(samples$cases[i, ]))
+      )
+      abline(v = samples$t[i], col = 'red')
+    }
+  })
+}
+
+plot_forward_samples(example_samples)
+```
+
+Let's also focus on the single example from the start of this document and step through some forecasts.
+
+```{r, fig.width = 10, fig.height = 15}
+single_example_times <- seq(10, 90, by = 10)
+single_example <- list(
+  target = torch_tensor(do.call(rbind, lapply(single_example_times, function(t) {
+    c(
+      log(0.25),
+      log(0.5),
+      log(0.2),
+      log(0.0001),
+      logit(clamp(example_simulation$S[, t], epsilon, 1 - epsilon)),
+      logit(clamp(example_simulation$I[, t], epsilon, 1 - epsilon))
+    )
+  })), device = device),
+  conditioning = torch_tensor(do.call(rbind, lapply(single_example_times, function(t) {
+    c(t, example_simulation$cases[1, ])
+  })), device = device),
+  latent = torch_tensor(abind::abind(lapply(single_example_times, function(t) {
+    cbind(example_simulation$S[1, ], example_simulation$I[1, ], example_simulation$R[1, ])
+  }), along = 0), device = device)
+)
+single_example_samples <- sample_dataset(256L, single_example)
+n_single_examples <- length(single_example_times)
+
+plot_forward_samples(single_example_samples)
+```
