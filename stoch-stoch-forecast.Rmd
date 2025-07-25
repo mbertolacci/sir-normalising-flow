@@ -1,5 +1,5 @@
 ---
-title: "Deterministic SIR Model with Stochastic Cases, with Normalising Flow"
+title: "Stochastic SIR Model with Stochastic Cases, with Normalising Flow"
 output: pdf_document
 ---
 
