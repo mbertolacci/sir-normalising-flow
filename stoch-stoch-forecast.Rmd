@@ -4,8 +4,14 @@ output: pdf_document
 ---
 
 ```{r}
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2)
+library(patchwork)
+library(tidyr)
 library(torch)
 library(torchflow)
+
+theme_set(theme_minimal())
 ```
 
 # Stochastic SIR model
@@ -76,6 +82,8 @@ forward_simulate <- function(
   }
 
   list(
+    N = N,
+    time = 1 : T,
     S = S / N,
     I = I / N,
     R = R / N,
@@ -102,14 +110,27 @@ example_simulation <- forward_simulate(
   R_1 = 0
 )
 
-plot(1 : 100, example_simulation$S[1, ], type = "l", xlab = 'Time', col = 'blue', ylim = c(0, 1))
-lines(1 : 100, example_simulation$I[1, ], col = 'red')
-lines(1 : 100, example_simulation$R[1, ], col = 'green')
-lines(1 : 100, example_simulation$cases[1, ], type = "h", col = 'black')
-legend(
-  'topright', c('S', 'I', 'R', 'Cases'),
-  col = c('blue', 'red', 'green', 'black'),
-  lty = 1, bg = 'white'
+example_simulation_df <- tibble(
+  time = 1 : 100,
+  S = example_simulation$S[1, ],
+  I = example_simulation$I[1, ],
+  R = example_simulation$R[1, ],
+  cases = example_simulation$N * example_simulation$cases[1, ]
+)
+
+wrap_plots(
+  example_simulation_df %>%
+    select(-cases) %>%
+    pivot_longer(-time, names_to = 'variable', values_to = 'value') %>%
+    ggplot(aes(x = time)) +
+      geom_line(
+        mapping = aes(y = value, colour = variable)
+      ) +
+      labs(x = 'Time', y = 'Proportion of population', colour = 'Compartment'),
+  ggplot(example_simulation_df, aes(x = time, xend = time, y = 0, yend = cases)) +
+    geom_segment() +
+    labs(x = 'Time', y = 'Cases'),
+  ncol = 1
 )
 ```
 
@@ -171,7 +192,9 @@ We generate four example datasets:
 ```{r}
 T <- 100
 N <- 300
-example_data <- generate(4, T = T, N = N)
+
+n_examples <- 4
+example_data <- generate(n_examples, T = T, N = N)
 str(example_data)
 print(example_data[c('gamma', 'beta', 'alpha', 'epsilon')])
 ```
@@ -179,10 +202,24 @@ print(example_data[c('gamma', 'beta', 'alpha', 'epsilon')])
 We can plot the results:
 
 ```{r}
-withr::with_par(list(mfrow = c(2, 1), mar = c(4, 4, 1, 1)), {
-  matplot(t(example_data$I), type = "l", lty = 1, xlab = 'Time', ylab = 'Infections')
-  matplot(t(example_data$cases), type = "h", lty = 1, xlab = 'Time', ylab = 'Cases')
-})
+example_data_df <- tibble(
+  time = rep(1 : T, each = n_examples),
+  example = rep(sprintf('Example %d', 1 : n_examples), T),
+  S = as.vector(example_data$S),
+  I = as.vector(example_data$I),
+  R = as.vector(example_data$R),
+  cases = as.vector(example_data$N * example_data$cases)
+)
+
+wrap_plots(
+  ggplot(example_data_df, aes(x = time, y = I, colour = example)) +
+    geom_line() +
+    labs(x = 'Time', y = 'Infections', colour = 'Example'),
+  ggplot(example_data_df, aes(x = time, xend = time, y = 0, yend = cases, colour = example)) +
+    geom_segment() +
+    labs(x = 'Time', y = 'Cases', colour = 'Example'),
+  ncol = 1
+)
 ```
 
 # Normalising flow
@@ -419,103 +456,187 @@ example_dataset <- list(
   latent = test_set$latent[example_indices, , , drop = FALSE]
 )
 
-example_samples <- sample_dataset(256L, example_dataset)
+n_samples <- 512L
+example_samples <- sample_dataset(n_samples, example_dataset)
 n_examples <- length(example_indices)
 ```
 
 Now we will plot the samples and the true values. First, histograms (red lines are the true values):
 
 ```{r, fig.width = 10, fig.height = 15}
-withr::with_par(list(mfrow = c(n_examples, n_params), mar = c(4, 4, 1, 1)), {
-  for (i in seq_len(n_examples)) {
-    plot_histogram <- function(ind, lab) {
-      hist(
-        example_samples$samples[, i, ind],
-        xlab = lab,
-        xlim = range(example_samples$samples[, , ind]),
-        main = paste('Example', i),
-        freq = FALSE,
-        breaks = 30
-      )
-      abline(v = example_samples$target[i, ind], col = 'red')
-    }
-    plot_histogram(1, 'alpha')
-    plot_histogram(2, 'beta')
-    plot_histogram(3, 'gamma')
-    plot_histogram(4, 'epsilon')
-    plot_histogram(5, 'S')
-    plot_histogram(6, 'I')
-  }
-})
+wrap_plots(lapply(dimnames(example_samples$samples)[[3]], function(param_i) {
+  example_samples_df_i <- tibble(
+    sample = rep(1 : n_samples, n_examples),
+    example = rep(sprintf('Example %d', 1 : n_examples), each = n_samples),
+    value = as.vector(example_samples$samples[, , param_i])
+  )
+
+  example_samples_df_i <- example_samples_df_i %>%
+    filter(
+      value > quantile(value, 0.001),
+      value < quantile(value, 0.999)
+    )
+
+  ggplot(example_samples_df_i, aes(value, after_stat(density))) +
+    geom_histogram(bins = 15) +
+    facet_grid(example ~ .) +
+    ggtitle(param_i) +
+    labs(x = param_i, y = NULL)
+}), nrow = 1)
 ```
 
 Then pairwise plots for the dynamical parameters (red lines are the true values):
 
 ```{r, fig.width = 10, fig.height = 15}
-withr::with_par(list(mfrow = c(n_examples, 5), mar = c(4, 4, 1, 1)), {
-  for (i in seq_len(n_examples)) {
-    plot_pair <- function(ind1, ind2, lab1, lab2) {
-      plot(
-        example_samples$samples[, i, ind1],
-        example_samples$samples[, i, ind2],
-        xlab = lab1,
-        ylab = lab2,
-        xlim = range(example_samples$samples[, , ind1]),
-        ylim = range(example_samples$samples[, , ind2]),
-        main = paste('Example', i)
-      )
-      abline(v = example_samples$target[i, ind1], col = 'red')
-      abline(h = example_samples$target[i, ind2], col = 'red')
-    }
-    plot_pair(2, 3, 'beta', 'gamma')
-    plot_pair(2, 4, 'beta', 'epsilon')
-    plot_pair(3, 4, 'gamma', 'epsilon')
-    plot_pair(2, 5, 'beta', 'S_t')
-    plot_pair(3, 5, 'gamma', 'S')
-  }
-})
+example_samples_pairwise <- tibble(
+  sample = rep(1 : n_samples, n_examples),
+  example = rep(sprintf('Example %d', 1 : n_examples), each = n_samples)
+)
+for (param_i in dimnames(example_samples$samples)[[3]]) {
+  example_samples_pairwise[[param_i]] <- as.vector(example_samples$samples[, , param_i])
+}
+
+make_pairwise_plot <- function(param_i, param_j, name_i, name_j) {
+  ggplot(
+    example_samples_pairwise %>%
+      filter(
+        {{ param_i }} > quantile({{ param_i }}, 0.001),
+        {{ param_i }} < quantile({{ param_i }}, 0.999),
+        {{ param_j }} > quantile({{ param_j }}, 0.001),
+        {{ param_j }} < quantile({{ param_j }}, 0.999)
+      ),
+    aes({{ param_i }}, {{ param_j }})
+  ) +
+    geom_density_2d(bins = 10) +
+    facet_wrap(~ example, ncol = 1) +
+    labs(x = name_i, y = name_j)
+}
+
+wrap_plots(
+  make_pairwise_plot(beta, gamma, 'beta', 'gamma'),
+  make_pairwise_plot(beta, epsilon, 'beta', 'epsilon'),
+  make_pairwise_plot(gamma, epsilon, 'gamma', 'epsilon'),
+  nrow = 1
+)
 ```
 
-Then we plot the true and forecasted trajectories of the latent variables. In this plot:
+Then we plot the true and forecasted trajectories for the I compartment and for the cases. Here,
 
-- The black line is the true trajectory.
-- The red lines are the 2.5th, 50th, and 97.5th posterior percentiles of the forecasted trajectories.
-- The blue line is the posterior mean of the forward simulated trajectories.
+- The black line is the true trajectory / cases.
+- For the I compartment, the blue line is the posterior mean, while the red line is the posterior median.
+- For the I compartment, the two ribbons span 25th to 75th and the 2.5th to 97.5th percentiles.
+- For the cases, the blue line is the posterior mean, while the ribbons span from 0 to the the 50th, 0 to the 75th, and 0 to the 97.5th percentiles.
 
 ```{r, fig.width = 10, fig.height = 15}
 plot_forward_samples <- function(samples) {
   n_examples <- length(samples$forward_samples)
-  withr::with_par(list(mfrow = c(n_examples, 4), mar = c(4, 4, 1, 1)), {
-    for (i in seq_len(n_examples)) {
-      forward_samples_i <- samples$forward_samples[[i]]
-      for (j in 1 : 3) {
-        plot(
-          1 : 100,
-          samples$latent[i, , j],
-          type = 'l',
-          xlab = 'Time',
-          ylab = c('S', 'I', 'R')[j],
-          ylim = c(0, 1)
-        )
-        abline(v = samples$t[i], col = 'red')
-        forward_mean <- apply(forward_samples_i[[j]], 2, mean)
-        forward_quantiles <- apply(forward_samples_i[[j]], 2, quantile, c(0.025, 0.5, 0.975))
-        lines(forward_samples_i$time, forward_quantiles[1, ], lty = 2, col = 'red')
-        lines(forward_samples_i$time, forward_quantiles[2, ], lty = 1, col = 'red')
-        lines(forward_samples_i$time, forward_quantiles[3, ], lty = 2, col = 'red')
-        lines(forward_samples_i$time, forward_mean, lty = 1, col = 'blue')
-      }
-      plot(
-        1 : T,
-        samples$cases[i, ],
-        type = 'h',
-        xlab = 'Time',
-        ylab = 'Cases',
-        ylim = c(0, max(samples$cases[i, ]))
-      )
-      abline(v = samples$t[i], col = 'red')
-    }
-  })
+  wrap_plots(lapply(seq_len(n_examples), function(i) {
+    forward_samples_i <- samples$forward_samples[[i]]
+
+    forward_mean_I <- apply(forward_samples_i$I, 2, mean)
+    forward_quantiles_I <- apply(forward_samples_i$I, 2, quantile, c(0.025, 0.25, 0.5, 0.75, 0.975))
+    latent_I_df <- tibble(
+      time = 1 : T,
+      I = samples$latent[i, , 2]
+    )
+    forward_I_df <- tibble(
+      time = forward_samples_i$time,
+      I_mean = forward_mean_I,
+      I_q025 = forward_quantiles_I[1, ],
+      I_q250 = forward_quantiles_I[2, ],
+      I_q500 = forward_quantiles_I[3, ],
+      I_q750 = forward_quantiles_I[4, ],
+      I_q975 = forward_quantiles_I[5, ]
+    )
+
+    forward_mean_cases <- apply(forward_samples_i$cases, 2, mean)
+    forward_quantiles_cases <- apply(forward_samples_i$cases, 2, quantile, c(0.5, 0.75, 0.975))
+    cases_df <- tibble(
+      time = 1 : T,
+      cases = N * samples$cases[i, ]
+    )
+    forward_cases_df <- tibble(
+      time = forward_samples_i$time,
+      cases_mean = N * forward_mean_cases,
+      cases_q500 = N * forward_quantiles_cases[1, ],
+      cases_q750 = N * forward_quantiles_cases[2, ],
+      cases_q975 = N * forward_quantiles_cases[3, ]
+    ) %>%
+      filter(time > samples$t[i])
+
+    wrap_plots(
+      ggplot(mapping= aes(time)) +
+        geom_line(
+          data = latent_I_df,
+          mapping = aes(time, I)
+        ) +
+        geom_ribbon(
+          data = forward_I_df,
+          mapping = aes(ymin = I_q025, ymax = I_q975),
+          alpha = 0.2,
+          fill = 'red'
+        ) +
+        geom_ribbon(
+          data = forward_I_df,
+          mapping = aes(ymin = I_q250, ymax = I_q750),
+          alpha = 0.2,
+          fill = 'red'
+        ) +
+        geom_line(
+          data = forward_I_df,
+          mapping = aes(time, I_q500),
+          colour = 'red'
+        ) +
+        geom_line(
+          data = forward_I_df,
+          mapping = aes(time, I_mean),
+          colour = 'blue'
+        ) +
+        geom_vline(
+          xintercept = samples$t[i],
+          colour = 'red',
+          linetype = 'dashed'
+        ) +
+        labs(x = 'Time', y = 'I') +
+        ggtitle(sprintf('Example %d, I compartment', i)),
+      ggplot(mapping = aes(time)) +
+        geom_segment(
+          data = cases_df,
+          mapping = aes(x = time, xend = time, y = 0, yend = cases)
+        ) +
+        geom_ribbon(
+          data = forward_cases_df,
+          mapping = aes(ymin = 0, ymax = cases_q500),
+          alpha = 0.2,
+          fill = 'red'
+        ) +
+        geom_ribbon(
+          data = forward_cases_df,
+          mapping = aes(ymin = 0, ymax = cases_q750),
+          alpha = 0.2,
+          fill = 'red'
+        ) +
+        geom_ribbon(
+          data = forward_cases_df,
+          mapping = aes(ymin = 0, ymax = cases_q975),
+          alpha = 0.2,
+          fill = 'red'
+        ) +
+        geom_line(
+          data = forward_cases_df,
+          mapping = aes(time, cases_mean),
+          colour = 'blue'
+        ) +
+        geom_vline(
+          xintercept = samples$t[i],
+          colour = 'red',
+          linetype = 'dashed'
+        ) +
+        labs(x = 'Time', y = 'Cases') +
+        ggtitle(sprintf('Example %d, cases', i)),
+      nrow = 1
+    )
+  }), ncol = 1)
 }
 
 plot_forward_samples(example_samples)
@@ -543,7 +664,7 @@ single_example <- list(
     cbind(example_simulation$S[1, ], example_simulation$I[1, ], example_simulation$R[1, ])
   }), along = 0), device = device)
 )
-single_example_samples <- sample_dataset(256L, single_example)
+single_example_samples <- sample_dataset(512L, single_example)
 n_single_examples <- length(single_example_times)
 
 plot_forward_samples(single_example_samples)
